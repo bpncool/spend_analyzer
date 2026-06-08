@@ -1,0 +1,26 @@
+[project]
+name = "personal-finance-backend"
+version = "0.1.0"
+description = "FastAPI backend for Personal Finance Intelligence Dashboard"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "sqlalchemy>=2.0.28",
+    "pydantic>=2.6.4",
+    "pdfplumber>=0.11.0",
+    "pandas>=2.2.1",
+    "scikit-learn>=1.4.1.post1",
+    "google-genai>=0.1.1",
+    "python-multipart>=0.0.9",
+    "python-dotenv>=1.0.0",
+    "fastembed>=0.2.0",
+    "google-antigravity>=0.1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.1.1",
+    "httpx>=0.27.0",
+]
