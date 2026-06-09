@@ -295,16 +295,17 @@ async def categorize_transactions_batch(db: Session, transactions_data: List[dic
     if gemini_client and llm_input:
         system_instruction = (
             "You are an expert personal finance auditor. Your task is to categorize a batch "
-            "of bank transactions into the allowed categories.\n"
-            "Choose the most appropriate category based on the description and amount. Guidelines:\n"
-            "- 'Online Food delivery': matches Swiggy, Zomato, Uber Eats, Foodpanda\n"
-            "- 'Food and Drinks outside': matches restaurants, cafes, Swiggy Dineout, Starbucks, McDonald's, bars, pub, coffee, bakery\n"
-            "- 'Online Cab Service': matches Uber rides, Ola, Rapido, cab, taxi\n"
-            "- 'Grocery' or 'Online Grocery': matches supermarket, Blinkit, Instacart, grocery store, market, food store\n"
-            "- 'Self-Transfers': matches transactions that are clearly transfers between the user's own bank accounts, credit card payment transfers, or self-settlements.\n"
-            "- 'Bank Transfer': matches transfers/payments to other individuals (P2P), salary credits, cash transfers, or payments to third-party entities/merchants.\n"
-            "- 'Investment': matches gold bonds, mutual funds, stocks, shares, SIP, broker transfers, savings bonds\n"
-            "Identify details from descriptions carefully and map to the specific category. Use 'Others' only if absolutely no specific category fits."
+            "of bank transactions. You must choose categories strictly from the 'Allowed Categories' "
+            "list provided in the prompt.\n"
+            "Here are examples of how descriptions should map to categories (select the closest matching category from the 'Allowed Categories' list):\n"
+            "- Food delivery descriptions (e.g. Swiggy, Zomato, Uber Eats) -> map to a food delivery/drinks category.\n"
+            "- Restaurant, cafe, bar, pub, coffee, bakery descriptions (e.g. Starbucks, McDonald's) -> map to a dining out/food category.\n"
+            "- Cab/transport service descriptions (e.g. Uber rides, Ola, Rapido) -> map to a cab/transport category.\n"
+            "- Supermarket, grocery store, market descriptions (e.g. Blinkit, Instacart) -> map to a grocery category.\n"
+            "- Own bank transfer, credit card payment, or self-settlement descriptions -> map to a self-transfers category.\n"
+            "- P2P transfer, salary credit, cash transfer, or third-party merchant descriptions -> map to a bank transfer category.\n"
+            "- Mutual funds, stocks, shares, SIP, or broker descriptions -> map to an investment category.\n"
+            "If none of the allowed categories in the prompt fit the transaction, default to 'Others'. Do NOT return any category name that is not explicitly in the 'Allowed Categories' list."
         )
 
         
