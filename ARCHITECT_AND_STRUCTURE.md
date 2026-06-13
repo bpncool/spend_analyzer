@@ -70,6 +70,7 @@ Below is the directory hierarchy of the Spend Analyzer repository:
 │   │   ├── main.py                 # FastAPI endpoints (uploads, transactions, overrides, linking, agent-runs)
 │   │   ├── models.py               # SQLAlchemy Database models (Transaction, Category, Rule, AgentRun)
 │   │   ├── parser.py               # Statement parsers (HDFC, Axis, Generic CSV, and Gemini parser)
+│   │   ├── rate_limiter.py         # Tracks AI rate limits in-memory and handles notification cooldowns
 │   │   ├── schemas.py              # Pydantic schemas for request/response serialization
 │   │   └── agents                  # Autonomous Multi-Agent modules (Google Antigravity SDK)
 │   │       ├── __init__.py
@@ -125,7 +126,8 @@ Stores individual transaction records extracted from bank or credit card stateme
 | `description_embedding`| `TEXT` (JSON)| Nullable | 384-float vector list stored as a JSON array. |
 | `exclude_from_matching`| `BOOLEAN` | Default: `False` | Flags if manual category override is permanent (skips re-categorization loops). |
 | `linked_transaction_id`| `VARCHAR(36)` | Nullable | Links counterpart transactions for internal/self transfers. |
-| `created_at` | `TIMESTAMP` | Default: UTC Now | Transaction insertion timestamp. |
+| `ai_rate_limited`      | `BOOLEAN`     | Default: `False` | True if transaction failed AI categorization due to rate limit. |
+| `created_at`           | `TIMESTAMP`   | Default: UTC Now | Transaction insertion timestamp. |
 
 ### 2. `categories` (Category Seed Table)
 Contains all categories allowed by the system.
@@ -158,3 +160,23 @@ Maintains logs and run statuses of orchestrator pipeline executions.
 | `statement_source`| `VARCHAR(150)`| Not Null | Details of how trigger scan was initialized (e.g. `folder_trigger (unsupported_layout.txt)`). |
 | `log_output` | `TEXT` (JSON) | Not Null | JSON list containing line-by-line runtime console logs. |
 | `error_message` | `TEXT` | Nullable | Traceback stack or error details if status is `failed`. |
+
+---
+
+## ⚡ AI Rate Limiter & Mitigation Flow
+
+To prevent application blockages and excess token consumption during high traffic, Spend Analyzer implements a proactive rate limit mitigation strategy:
+
+1. **In-Memory Rate Limiter (`rate_limiter.py`)**:
+   - Tracks if the AI engine is rate limited and blocks calls for a specific window (default: 5 minutes).
+   - Manages a de-duplicated notification cooldown (default: 1 hour) to prevent email spam.
+   - De-duplicated emails are dispatched to `scratch/notifications.jsonl`.
+2. **Batch Pacing**:
+   - Introduces a `1.5s` pacing delay (`await asyncio.sleep(1.5)`) between consecutive chunk requests to smoothen traffic.
+3. **Graceful Fallback**:
+   - Checks `is_ai_rate_limited()` before calls to Gemini.
+   - If blocked or if a `429`/`RESOURCE_EXHAUSTED` error is caught, the transactions are categorized under `"Others"` and flagged as `ai_rate_limited = True` in the database.
+4. **Dashboard Control & Reclassification**:
+   - Displays a warning banner indicating active block windows and remaining retry duration.
+   - Provides table filtering via "⚠️ Rate Limited Only" to view flagged items.
+   - Allows users to select multiple transactions and force re-classification through `POST /api/transactions/reclassify` when limits clear, running the entire mapping pipeline.

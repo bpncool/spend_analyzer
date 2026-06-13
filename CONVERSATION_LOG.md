@@ -41,6 +41,15 @@ This document traces the development history, architectural decisions, technical
 * Created the `triggers.py` module containing a polling loop that checks the `backend/statements_to_process/` and `backend/email_inbox/` directories every 10 seconds.
 * Dropping files in these folders triggers the agentic orchestrator automatically.
 
+### 3. Agent Execution Monitoring, Database Persistence, & Frontend Control Panel
+* **Persistence**: Added an `AgentRun` model in [models.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20FInance%20Handler/backend/app/models.py) to save running logs, status updates (e.g., `started`, `parsing`, `mapping`, `analyzing`, `frontend`, `completed`, `failed`), statement source identifiers, and error details.
+* **FastAPI Lifecycle & API Endpoints**:
+  - Automatically starts the folder/email background trigger polling loop via `asyncio.create_task` on FastAPI backend startup.
+  - Added the `GET /api/agent-runs` endpoint for run history retrieval and the `POST /api/agent-runs/trigger` endpoint to trigger statement scanning and processing on-demand.
+* **Frontend Console Dashboard**:
+  - Added an interactive `🤖 Agent Pipeline` tab in the React [App.tsx](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20FInance%20Handler/frontend/src/App.tsx) dashboard with a `"Trigger Manual Scan"` button.
+  - Implemented background polling (every 5 seconds) to fetch and render execution runs, status badges, error stack traces, and expandable CLI console logs loaded dynamically from the database.
+
 ---
 
 ## ⚙️ Key Technical Decisions & Constraints

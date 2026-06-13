@@ -2,10 +2,23 @@ from typing import List, Dict, Any
 import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from google.genai.errors import APIError
 
 from .models import Transaction
 from .schemas import InsightOut
 from .categorizer import gemini_client
+from .rate_limiter import is_ai_rate_limited, trigger_ai_rate_limit, should_send_notification
+from .agents.utility_agents import send_notification_email
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Helper to detect if an exception represents an API rate limit error."""
+    if isinstance(e, APIError):
+        return e.code == 429 or e.status == "RESOURCE_EXHAUSTED" or (e.message and "RESOURCE_EXHAUSTED" in e.message)
+    code = getattr(e, "code", None)
+    status_attr = getattr(e, "status", None)
+    msg = str(e)
+    return code == 429 or status_attr == "RESOURCE_EXHAUSTED" or "RESOURCE_EXHAUSTED" in msg or "429" in msg
+
 
 DISCRETIONARY_CATEGORIES = [
     "Online Cab Service",
@@ -116,8 +129,8 @@ async def generate_natural_language_insights(db: Session) -> List[InsightOut]:
         
     insights = []
     
-    # If Gemini is configured, use it to generate highly engaging natural language copy
-    if gemini_client:
+    # If Gemini is configured and not rate-limited, use it to generate highly engaging natural language copy
+    if gemini_client and not is_ai_rate_limited():
         corr_summary = ""
         for c in correlations:
             corr_summary += f"- {c['category']}: correlation coefficient={c['correlation']:.2f}, impact level={c['impact_level']}, savings impact per $100={c['savings_rate_impact']:.2f}%\n"
@@ -165,6 +178,13 @@ async def generate_natural_language_insights(db: Session) -> List[InsightOut]:
             return insights
         except Exception as e:
             print(f"Gemini insight generation failed: {e}")
+            if _is_rate_limit_error(e):
+                trigger_ai_rate_limit(5)
+                if should_send_notification():
+                    send_notification_email(
+                        "Spend Analyzer: Gemini API Rate Limit Triggered",
+                        "The Gemini API rate limit has been reached (429/RESOURCE_EXHAUSTED). The system is falling back to local rule and vector similarity matching."
+                    )
             
     # Standard rule-based fallback recommendations
     for c in correlations:
@@ -184,3 +204,4 @@ async def generate_natural_language_insights(db: Session) -> List[InsightOut]:
         ))
         
     return insights
+

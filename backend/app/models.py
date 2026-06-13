@@ -57,6 +57,7 @@ class Transaction(Base):
     description_embedding = Column(EmbeddingType, nullable=True)
     exclude_from_matching = Column(Boolean, default=False, nullable=False)
     linked_transaction_id = Column(String(36), ForeignKey("transactions.id"), nullable=True)
+    ai_rate_limited = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 
 

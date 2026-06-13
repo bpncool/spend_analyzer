@@ -5,9 +5,22 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 import pdfplumber
 from google.genai import types
+from google.genai.errors import APIError
 
 from .categorizer import gemini_client
 from .schemas import AIParsingResponse
+from .rate_limiter import is_ai_rate_limited, trigger_ai_rate_limit, should_send_notification
+from .agents.utility_agents import send_notification_email
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Helper to detect if an exception represents an API rate limit error."""
+    if isinstance(e, APIError):
+        return e.code == 429 or e.status == "RESOURCE_EXHAUSTED" or (e.message and "RESOURCE_EXHAUSTED" in e.message)
+    code = getattr(e, "code", None)
+    status_attr = getattr(e, "status", None)
+    msg = str(e)
+    return code == 429 or status_attr == "RESOURCE_EXHAUSTED" or "RESOURCE_EXHAUSTED" in msg or "429" in msg
+
 
 def clean_amount(val: Any) -> float:
     """Helper to convert string amounts with commas, currency symbols, or parentheses to float."""
@@ -469,6 +482,9 @@ async def parse_statement_with_gemini(file_content_text: str) -> List[Dict[str, 
     if not gemini_client:
         raise ValueError("Gemini API client is not initialized. Ensure GEMINI_API_KEY is configured.")
         
+    if is_ai_rate_limited():
+        raise ValueError("AI Parsing is temporarily rate-limited.")
+        
     system_instruction = (
         "You are an expert bank statement auditing assistant. Your task is to extract "
         "all transaction rows from the provided bank statement text. "
@@ -487,17 +503,28 @@ async def parse_statement_with_gemini(file_content_text: str) -> List[Dict[str, 
     infer it from the statement header or period.
     """
     
-    response = gemini_client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=AIParsingResponse,
-            temperature=0.0,
+    try:
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=AIParsingResponse,
+                temperature=0.0,
+            )
         )
-    )
-    
+    except Exception as e:
+        print(f"Gemini statement parsing failed: {e}")
+        if _is_rate_limit_error(e):
+            trigger_ai_rate_limit(5)
+            if should_send_notification():
+                send_notification_email(
+                    "Spend Analyzer: Gemini API Rate Limit Triggered",
+                    "The Gemini API rate limit has been reached (429/RESOURCE_EXHAUSTED). The system is falling back to local rule and vector similarity matching."
+                )
+        raise ValueError("AI Parsing is temporarily rate-limited.") from e
+        
     result = AIParsingResponse.model_validate_json(response.text)
     
     parsed_txs = []
@@ -514,6 +541,7 @@ async def parse_statement_with_gemini(file_content_text: str) -> List[Dict[str, 
         })
         
     return parsed_txs
+
 
 def detect_bank_from_pdf(file_bytes: bytes) -> str:
     """Detects the originating bank layout for PDF statement uploads."""

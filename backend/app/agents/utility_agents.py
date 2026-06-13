@@ -199,6 +199,7 @@ def update_transaction_categories(category_mappings_json: str) -> str:
             tx = db.query(Transaction).filter(Transaction.id == item["id"]).first()
             if tx:
                 tx.category = item["category"]
+                tx.ai_rate_limited = item.get("ai_rate_limited", False)
                 
                 # Proactively generate embedding
                 from ..categorizer import get_embedding

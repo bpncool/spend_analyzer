@@ -1,13 +1,19 @@
 import os
 import json
+import asyncio
 from google.antigravity import Agent, LocalAgentConfig
 from .utility_agents import (
     fetch_uncategorized_transactions, fetch_historical_rules,
-    fetch_historical_embeddings, update_transaction_categories, log_run_step
+    fetch_historical_embeddings, update_transaction_categories, log_run_step,
+    send_notification_email
 )
-from ..categorizer import find_rule_match, compute_cosine_similarity, get_embeddings_batch, PREDEFINED_CATEGORIES, gemini_client
+from ..categorizer import (
+    find_rule_match, compute_cosine_similarity, get_embeddings_batch, 
+    PREDEFINED_CATEGORIES, gemini_client, _is_rate_limit_error
+)
 from google.genai import types
 from ..schemas import BatchCategorizationResponse
+from ..rate_limiter import is_ai_rate_limited, trigger_ai_rate_limit, should_send_notification
 
 # =============================================================================
 # Tools for Transaction Mapper Agent
@@ -86,7 +92,7 @@ async def map_with_gemini(unmatched_txs_json: str) -> str:
     Args:
         unmatched_txs_json: JSON string of transactions that need LLM classification.
     Returns:
-        JSON string of mappings, e.g. [{"id": "uuid", "category": "Food"}]
+        JSON string of mappings, e.g. [{"id": "uuid", "category": "Food", "ai_rate_limited": False}]
     """
     txs = json.loads(unmatched_txs_json)
     if not txs:
@@ -130,44 +136,82 @@ async def map_with_gemini(unmatched_txs_json: str) -> str:
     chunk_size = 100
     results_map = {}
     
-    for i in range(0, len(llm_input), chunk_size):
-        chunk = llm_input[i:i + chunk_size]
-        prompt = f"""
-        Please categorize the following batch of bank transactions:
-        Transactions:
-        {json.dumps(chunk, indent=2)}
-
-        Allowed Categories:
-        {", ".join(categories)}
-
-        You must return a JSON object containing a list of results conforming strictly to the target schema.
-        If none of the categories apply to a transaction, use 'Others'.
-        """
-        
-        try:
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    response_schema=BatchCategorizationResponse,
-                    temperature=0.1,
-                ),
-            )
-            batch_result = BatchCategorizationResponse.model_validate_json(response.text)
-            for item in batch_result.results:
-                results_map[item.index] = item.category
-        except Exception as e:
-            print(f"Gemini Mapper fallback batch call failed: {e}")
+    # If rate limit is already active, fall back immediately
+    if is_ai_rate_limited():
+        for idx in range(len(llm_input)):
+            results_map[idx] = ("Others", True)
+    else:
+        for i in range(0, len(llm_input), chunk_size):
+            chunk = llm_input[i:i + chunk_size]
             
+            # Check rate limit before chunk request
+            if is_ai_rate_limited():
+                for item in chunk:
+                    results_map[item["index"]] = ("Others", True)
+                continue
+
+            if i > 0:
+                await asyncio.sleep(1.5)
+
+            # Check rate limit again after delay
+            if is_ai_rate_limited():
+                for item in chunk:
+                    results_map[item["index"]] = ("Others", True)
+                continue
+
+            prompt = f"""
+            Please categorize the following batch of bank transactions:
+            Transactions:
+            {json.dumps(chunk, indent=2)}
+
+            Allowed Categories:
+            {", ".join(categories)}
+
+            You must return a JSON object containing a list of results conforming strictly to the target schema.
+            If none of the categories apply to a transaction, use 'Others'.
+            """
+            
+            try:
+                response = gemini_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        response_schema=BatchCategorizationResponse,
+                        temperature=0.1,
+                    ),
+                )
+                batch_result = BatchCategorizationResponse.model_validate_json(response.text)
+                for item in batch_result.results:
+                    results_map[item.index] = (item.category, False)
+            except Exception as e:
+                print(f"Gemini Mapper fallback batch call failed: {e}")
+                if _is_rate_limit_error(e):
+                    trigger_ai_rate_limit(5)
+                    if should_send_notification():
+                        send_notification_email(
+                            "Spend Analyzer: Gemini API Rate Limit Triggered",
+                            "The Gemini API rate limit has been reached (429/RESOURCE_EXHAUSTED). The system is falling back to local rule and vector similarity matching."
+                        )
+                    for item in chunk:
+                        results_map[item["index"]] = ("Others", True)
+                else:
+                    for item in chunk:
+                        results_map[item["index"]] = ("Others", False)
+                
     # Map responses back to transaction IDs
     mappings = []
     for idx, tx in enumerate(txs):
-        category = results_map.get(idx, "Others")
-        mappings.append({"id": tx["id"], "category": category})
+        category, rate_limited = results_map.get(idx, ("Others", False))
+        mappings.append({
+            "id": tx["id"], 
+            "category": category,
+            "ai_rate_limited": rate_limited
+        })
         
     return json.dumps(mappings)
+
 
 def save_mappings_to_db(mappings_json: str) -> str:
     """Saves the final category assignments to the database.

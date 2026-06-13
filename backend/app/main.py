@@ -10,7 +10,8 @@ from .models import Category, Transaction, CategorizationRule, AgentRun
 from .schemas import (
     TransactionOut, CategoryOut, CategoryBase, 
     OverrideRequest, InsightOut, AIConfirmRequest,
-    LinkRequest, UnlinkRequest, AgentRunOut
+    LinkRequest, UnlinkRequest, AgentRunOut,
+    ReclassifyRequest
 )
 from .parser import (
     parse_generic_csv_statement, parse_axis_bank_pdf_statement, parse_hdfc_bank_txt_statement,
@@ -63,6 +64,19 @@ async def startup_event():
                 print("Successfully added column linked_transaction_id to transactions table.")
             except Exception as e:
                 print(f"Error adding linked_transaction_id column: {e}")
+                db.rollback()
+            finally:
+                db.close()
+                
+        # 3. Add ai_rate_limited
+        if "ai_rate_limited" not in columns:
+            db = SessionLocal()
+            try:
+                db.execute(text("ALTER TABLE transactions ADD COLUMN ai_rate_limited BOOLEAN DEFAULT FALSE;"))
+                db.commit()
+                print("Successfully added column ai_rate_limited to transactions table.")
+            except Exception as e:
+                print(f"Error adding ai_rate_limited column: {e}")
                 db.rollback()
             finally:
                 db.close()
@@ -211,7 +225,8 @@ async def upload_bank_statement(
                 source=source_type,
                 raw_payload=item.get("raw_payload"),
                 description_embedding=item.get("description_embedding"),
-                account_id=account_name
+                account_id=account_name,
+                ai_rate_limited=item.get("ai_rate_limited", False)
             )
             db.add(tx)
             added_count += 1
@@ -285,7 +300,8 @@ async def confirm_ai_parsing(
                 source=source_type,
                 raw_payload=item.get("raw_payload"),
                 description_embedding=item.get("description_embedding"),
-                account_id=account_name
+                account_id=account_name,
+                ai_rate_limited=item.get("ai_rate_limited", False)
             )
             db.add(tx)
             added_count += 1
@@ -549,3 +565,53 @@ async def override_transaction_category(
 async def get_analytics_insights(db: Session = Depends(get_db)):
     """Retrieves correlation metrics and text recommendation insights."""
     return await generate_natural_language_insights(db)
+
+@app.get("/api/ai-status")
+def get_ai_status():
+    """Retrieves the rate limit status of the AI engine."""
+    from .rate_limiter import is_ai_rate_limited, get_rate_limit_seconds_remaining
+    return {
+        "is_rate_limited": is_ai_rate_limited(),
+        "seconds_remaining": get_rate_limit_seconds_remaining()
+    }
+
+@app.post("/api/transactions/reclassify")
+async def reclassify_transactions(req: ReclassifyRequest, db: Session = Depends(get_db)):
+    """
+    Force re-classification of selected transactions through the entire mapping loop:
+    1. Rule match (internal)
+    2. Semantic vector match (internal)
+    3. Gemini API (external)
+    """
+    txs = db.query(Transaction).filter(Transaction.id.in_(req.transaction_ids)).all()
+    if not txs:
+        return {"message": "No transactions found to reclassify."}
+
+    txs_data = []
+    for tx in txs:
+        txs_data.append({
+            "id": tx.id,
+            "description": tx.description,
+            "amount": float(tx.amount),
+            "date": str(tx.date),
+            "balance_after": float(tx.balance_after) if tx.balance_after is not None else None,
+            "category": tx.category,
+            "description_embedding": tx.description_embedding,
+            "ai_rate_limited": False
+        })
+
+    categorized = await categorize_transactions_batch(db, txs_data)
+
+    updated_count = 0
+    for item in categorized:
+        tx = db.query(Transaction).filter(Transaction.id == item["id"]).first()
+        if tx:
+            tx.category = item.get("category", "Others")
+            tx.ai_rate_limited = item.get("ai_rate_limited", False)
+            if item.get("description_embedding") is not None:
+                tx.description_embedding = item["description_embedding"]
+            updated_count += 1
+            
+    db.commit()
+    return {"message": f"Successfully processed re-classification for {updated_count} transactions."}
+

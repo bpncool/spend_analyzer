@@ -22,6 +22,7 @@ class TransactionOut(BaseModel):
     source: str
     account_id: Optional[str] = None
     linked_transaction_id: Optional[str] = None
+    ai_rate_limited: bool = False
     
     class Config:
         from_attributes = True
@@ -52,6 +53,9 @@ class LinkRequest(BaseModel):
 
 class UnlinkRequest(BaseModel):
     transaction_id: str
+
+class ReclassifyRequest(BaseModel):
+    transaction_ids: List[str]
 
 
 class CategorizationResponse(BaseModel):

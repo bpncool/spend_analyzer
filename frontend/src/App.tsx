@@ -21,6 +21,7 @@ interface Transaction {
   source: string;
   account_id?: string;
   linked_transaction_id?: string;
+  ai_rate_limited?: boolean;
 }
 
 interface Category {
@@ -87,17 +88,27 @@ export default function App() {
   const [agentRuns, setAgentRuns] = useState<any[]>([]);
   const [triggeringAgent, setTriggeringAgent] = useState(false);
 
+  // AI Status & Rate Limit States
+  const [aiStatus, setAiStatus] = useState<{ is_rate_limited: boolean; seconds_remaining: number }>({
+    is_rate_limited: false,
+    seconds_remaining: 0
+  });
+  const [showOnlyRateLimited, setShowOnlyRateLimited] = useState(false);
+  const [selectedTxIds, setSelectedTxIds] = useState<Record<string, boolean>>({});
+  const [reclassifying, setReclassifying] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch all data
   const fetchData = async () => {
     try {
-      const [txRes, catRes, insRes, accRes, runRes] = await Promise.all([
+      const [txRes, catRes, insRes, accRes, runRes, statusRes] = await Promise.all([
         fetch(`${API_BASE}/transactions`),
         fetch(`${API_BASE}/categories`),
         fetch(`${API_BASE}/analytics/insights`),
         fetch(`${API_BASE}/accounts`),
-        fetch(`${API_BASE}/agent-runs`)
+        fetch(`${API_BASE}/agent-runs`),
+        fetch(`${API_BASE}/ai-status`)
       ]);
 
       if (txRes.ok) setTransactions(await txRes.json());
@@ -105,6 +116,7 @@ export default function App() {
       if (insRes.ok) setInsights(await insRes.json());
       if (accRes.ok) setAccounts(await accRes.json());
       if (runRes.ok) setAgentRuns(await runRes.json());
+      if (statusRes.ok) setAiStatus(await statusRes.json());
     } catch (err) {
       console.error("Failed to connect to API:", err);
     } finally {
@@ -116,7 +128,7 @@ export default function App() {
     fetchData();
     
     // Background polling for agent execution runs (every 5 seconds)
-    const interval = setInterval(async () => {
+    const runInterval = setInterval(async () => {
       try {
         const res = await fetch(`${API_BASE}/agent-runs`);
         if (res.ok) {
@@ -127,7 +139,22 @@ export default function App() {
       }
     }, 5000);
 
-    return () => clearInterval(interval);
+    // Background polling for AI rate limit status (every 10 seconds)
+    const statusInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/ai-status`);
+        if (res.ok) {
+          setAiStatus(await res.json());
+        }
+      } catch (err) {
+        console.error("Failed to poll AI status:", err);
+      }
+    }, 10000);
+
+    return () => {
+      clearInterval(runInterval);
+      clearInterval(statusInterval);
+    };
   }, []);
 
 
@@ -326,6 +353,31 @@ export default function App() {
     }
   };
 
+  // Perform force re-classification
+  const handleForceReclassify = async () => {
+    const ids = Object.keys(selectedTxIds).filter(id => selectedTxIds[id]);
+    if (ids.length === 0) return;
+    setReclassifying(true);
+    try {
+      const res = await fetch(`${API_BASE}/transactions/reclassify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transaction_ids: ids })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSelectedTxIds({});
+        fetchData();
+      } else {
+        alert(data.detail || "Reclassification failed.");
+      }
+    } catch (err) {
+      alert("Failed to connect to backend for reclassification.");
+    } finally {
+      setReclassifying(false);
+    }
+  };
+
 
   // Filter transactions for the selected account view
   const accountTransactions = transactions.filter(tx => {
@@ -412,7 +464,8 @@ export default function App() {
       const matchesSearch = tx.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
                             (tx.category && tx.category.toLowerCase().includes(searchTerm.toLowerCase()));
       const matchesCategory = filterCategory === "all" || tx.category === filterCategory;
-      return matchesSearch && matchesCategory;
+      const matchesRateLimit = !showOnlyRateLimited || tx.ai_rate_limited;
+      return matchesSearch && matchesCategory && matchesRateLimit;
     })
     .sort((a, b) => {
       let multiplier = sortOrder === "asc" ? 1 : -1;
@@ -456,6 +509,19 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 mt-8 space-y-8">
+        {aiStatus.is_rate_limited && (
+          <div className="p-4 bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-xl flex items-center justify-between shadow-lg shadow-amber-500/5 animate-pulse">
+            <div className="flex items-center gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-400 font-bold" />
+              <div>
+                <span className="font-semibold text-white">AI Engine Rate-Limited</span>
+                <span className="text-sm text-slate-400 block mt-0.5">
+                  AI categorization and conversational insights are temporarily paused to protect API limits. Local rules and vector search remain operational. Resuming in {aiStatus.seconds_remaining} seconds.
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
         
         {/* View Switcher Tabs */}
         <section className="bg-slate-800/20 p-1.5 rounded-xl border border-slate-800 flex items-center space-x-2 overflow-x-auto">
@@ -715,6 +781,33 @@ export default function App() {
               
               {/* Filter controls */}
               <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
+                {Object.values(selectedTxIds).some(Boolean) && (
+                  <button
+                    onClick={handleForceReclassify}
+                    disabled={reclassifying}
+                    className="px-4 py-2 text-sm bg-violet-600 hover:bg-violet-500 disabled:bg-slate-850 disabled:text-slate-500 disabled:cursor-not-allowed text-white rounded-lg font-semibold flex items-center gap-2 cursor-pointer transition-all shadow-lg shadow-violet-500/10"
+                  >
+                    {reclassifying ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" /> Reclassifying...
+                      </>
+                    ) : (
+                      `Reclassify Selected (${Object.values(selectedTxIds).filter(Boolean).length})`
+                    )}
+                  </button>
+                )}
+
+                <button
+                  onClick={() => setShowOnlyRateLimited(!showOnlyRateLimited)}
+                  className={`px-4 py-2 text-sm border rounded-lg transition-all cursor-pointer flex items-center gap-2 ${
+                    showOnlyRateLimited
+                      ? "bg-amber-600/20 border-amber-500 text-amber-300 font-semibold"
+                      : "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <span>⚠️ Rate Limited Only</span>
+                </button>
+
                 <div className="relative flex-1 md:flex-initial">
                   <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
                   <input
@@ -743,6 +836,21 @@ export default function App() {
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-800 text-slate-400 text-xs font-semibold uppercase tracking-wider bg-slate-900/30">
+                    <th className="px-6 py-4 w-12">
+                      <input
+                        type="checkbox"
+                        checked={filteredTransactions.length > 0 && filteredTransactions.every(tx => selectedTxIds[tx.id])}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          const newSelected = { ...selectedTxIds };
+                          filteredTransactions.forEach(tx => {
+                            newSelected[tx.id] = checked;
+                          });
+                          setSelectedTxIds(newSelected);
+                        }}
+                        className="rounded border-slate-750 bg-slate-900 text-violet-600 focus:ring-violet-500 focus:ring-offset-slate-900 cursor-pointer"
+                      />
+                    </th>
                     <th className="px-6 py-4">Date</th>
                     <th className="px-6 py-4">Account</th>
                     <th className="px-6 py-4">Description</th>
@@ -754,6 +862,19 @@ export default function App() {
                 <tbody className="divide-y divide-slate-800/50 text-sm">
                   {filteredTransactions.map((tx) => (
                     <tr key={tx.id} className="hover:bg-slate-800/20 transition-colors">
+                      <td className="px-6 py-4 w-12">
+                        <input
+                          type="checkbox"
+                          checked={!!selectedTxIds[tx.id]}
+                          onChange={(e) => {
+                            setSelectedTxIds({
+                              ...selectedTxIds,
+                              [tx.id]: e.target.checked
+                            });
+                          }}
+                          className="rounded border-slate-750 bg-slate-900 text-violet-600 focus:ring-violet-500 focus:ring-offset-slate-900 cursor-pointer"
+                        />
+                      </td>
                       <td className="px-6 py-4 text-slate-300 font-medium whitespace-nowrap">
                         {tx.date}
                       </td>
@@ -761,7 +882,14 @@ export default function App() {
                         {tx.account_id || "General"}
                       </td>
                       <td className="px-6 py-4 text-white font-medium max-w-xs truncate" title={tx.description}>
-                        {tx.description}
+                        <div className="flex items-center gap-2">
+                          <span className="truncate">{tx.description}</span>
+                          {tx.ai_rate_limited && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/25 shrink-0" title="AI categorization rate limited. Defaulted to Others.">
+                              ⚠️ Rate Limited
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-6 py-3 whitespace-nowrap">
                         {editingTxId === tx.id ? (
@@ -877,7 +1005,7 @@ export default function App() {
                   ))}
                   {filteredTransactions.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="text-center py-8 text-slate-400">
+                      <td colSpan={7} className="text-center py-8 text-slate-400">
                         No transactions found matching your criteria.
                       </td>
                     </tr>
@@ -1098,6 +1226,12 @@ export default function App() {
             <h3 className="text-lg font-bold text-white flex items-center gap-2">
               <AlertTriangle className="h-5 w-5 text-amber-500" /> AI Parsing Approval
             </h3>
+            {aiStatus.is_rate_limited && (
+              <div className="p-3.5 bg-rose-500/10 border border-rose-550/20 text-rose-300 rounded-xl text-xs flex flex-col gap-1.5 leading-relaxed">
+                <span className="font-semibold text-white">⚠️ AI Engine Currently Rate-Limited</span>
+                <span>The Gemini API is temporarily rate-limited. AI Statement Ingestion is disabled until the block window expires (resuming in {aiStatus.seconds_remaining} seconds).</span>
+              </div>
+            )}
             <p className="text-sm text-slate-300">
               The standard parser could not read the layout of <strong className="text-violet-400">"{aiConfirmModal.filename}"</strong>.
             </p>
@@ -1117,7 +1251,8 @@ export default function App() {
             <div className="flex flex-col gap-2.5 pt-2">
               <button
                 onClick={handleAIConfirm}
-                className="w-full py-2.5 text-sm font-medium bg-amber-600 hover:bg-amber-500 text-white rounded-lg cursor-pointer transition-all flex items-center justify-center gap-2 shadow-lg shadow-amber-600/10"
+                disabled={aiStatus.is_rate_limited || uploading}
+                className="w-full py-2.5 text-sm font-medium bg-amber-600 hover:bg-amber-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white rounded-lg cursor-pointer transition-all flex items-center justify-center gap-2 shadow-lg shadow-amber-600/10"
               >
                 Approve and Ingest
               </button>

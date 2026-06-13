@@ -1,16 +1,30 @@
 import re
 import numpy as np
 import json
+import asyncio
 from typing import List, Optional
 from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from fastembed import TextEmbedding
 
 from .config import settings
 from .models import Category, Transaction, CategorizationRule
 from .schemas import CategorizationResponse, BatchCategorizationItem, BatchCategorizationResponse
+from .rate_limiter import is_ai_rate_limited, trigger_ai_rate_limit, should_send_notification
+from .agents.utility_agents import send_notification_email
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Helper to detect if an exception represents an API rate limit error."""
+    if isinstance(e, APIError):
+        return e.code == 429 or e.status == "RESOURCE_EXHAUSTED" or (e.message and "RESOURCE_EXHAUSTED" in e.message)
+    code = getattr(e, "code", None)
+    status_attr = getattr(e, "status", None)
+    msg = str(e)
+    return code == 429 or status_attr == "RESOURCE_EXHAUSTED" or "RESOURCE_EXHAUSTED" in msg or "429" in msg
+
 
 # Initialize Gemini Client if API key is provided
 gemini_client = None
@@ -162,7 +176,7 @@ def find_semantic_match(db: Session, new_embedding: List[float], threshold: floa
 
 async def query_gemini_categorizer(description: str, amount: float, categories: List[str]) -> Optional[str]:
     """Tier 3: Structured Gemini API call."""
-    if not gemini_client:
+    if not gemini_client or is_ai_rate_limited():
         return None
         
     sanitized = sanitize_description(description)
@@ -200,8 +214,16 @@ async def query_gemini_categorizer(description: str, amount: float, categories: 
             return result.category
     except Exception as e:
         print(f"Gemini generation call failed: {e}")
+        if _is_rate_limit_error(e):
+            trigger_ai_rate_limit(5)
+            if should_send_notification():
+                send_notification_email(
+                    "Spend Analyzer: Gemini API Rate Limit Triggered",
+                    "The Gemini API rate limit has been reached (429/RESOURCE_EXHAUSTED). The system is falling back to local rule and vector similarity matching."
+                )
         
     return None
+
 
 async def categorize_transaction(db: Session, description: str, amount: float) -> str:
     """Core pipeline entry: Rule-based -> Semantic pgvector -> Gemini LLM."""
@@ -238,7 +260,12 @@ async def categorize_transactions_batch(db: Session, transactions_data: List[dic
     Modifies transactions_data in-place to attach:
     - 'category'
     - 'description_embedding'
+    - 'ai_rate_limited'
     """
+    # Initialize all with default flags
+    for tx in transactions_data:
+        tx["ai_rate_limited"] = tx.get("ai_rate_limited", False)
+
     db_categories = db.query(Category.name).all()
     categories = [c[0] for c in db_categories] if db_categories else PREDEFINED_CATEGORIES
 
@@ -251,6 +278,7 @@ async def categorize_transactions_batch(db: Session, transactions_data: List[dic
         if rule_cat:
             tx["category"] = rule_cat
             tx["description_embedding"] = None
+            tx["ai_rate_limited"] = False
         else:
             unmatched_indices.append(idx)
             unmatched_payloads.append(tx)
@@ -276,6 +304,7 @@ async def categorize_transactions_batch(db: Session, transactions_data: List[dic
             
         if semantic_cat:
             tx["category"] = semantic_cat
+            tx["ai_rate_limited"] = False
         else:
             still_unmatched_indices.append(idx)
             still_unmatched_payloads.append(tx)
@@ -308,59 +337,84 @@ async def categorize_transactions_batch(db: Session, transactions_data: List[dic
             "If none of the allowed categories in the prompt fit the transaction, default to 'Others'. Do NOT return any category name that is not explicitly in the 'Allowed Categories' list."
         )
 
-        
-        prompt = f"""
-        Please categorize the following batch of bank transactions:
-        Transactions:
-        {json.dumps(llm_input, indent=2)}
-
-        Allowed Categories:
-        {", ".join(categories)}
-
-        You must return a JSON object containing a list of results conforming strictly to the target schema.
-        If none of the categories apply to a transaction, use 'Others'.
-        """
-        
         # Chunk requests to prevent exceeding output token limits
         chunk_size = 120
         results_map = {}
-        for i in range(0, len(llm_input), chunk_size):
-            chunk = llm_input[i:i + chunk_size]
-            prompt = f"""
-            Please categorize the following batch of bank transactions:
-            Transactions:
-            {json.dumps(chunk, indent=2)}
-
-            Allowed Categories:
-            {", ".join(categories)}
-
-            You must return a JSON object containing a list of results conforming strictly to the target schema.
-            If none of the categories apply to a transaction, use 'Others'.
-            """
-            
-            try:
-                response = gemini_client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        response_schema=BatchCategorizationResponse,
-                        temperature=0.1,
-                    ),
-                )
-                batch_result = BatchCategorizationResponse.model_validate_json(response.text)
-                for item in batch_result.results:
-                    results_map[item.index] = item.category
-            except Exception as e:
-                print(f"Batch GenAI categorization call failed for chunk {i//chunk_size}: {e}")
+        
+        # If rate limit is already active at the start of Step 3, block immediately
+        if is_ai_rate_limited():
+            for idx in still_unmatched_indices:
+                results_map[idx] = ("Others", True)
+        else:
+            for i in range(0, len(llm_input), chunk_size):
+                chunk = llm_input[i:i + chunk_size]
                 
+                # Check rate limit before chunk request
+                if is_ai_rate_limited():
+                    for item in chunk:
+                        results_map[item["index"]] = ("Others", True)
+                    continue
+
+                if i > 0:
+                    await asyncio.sleep(1.5)
+
+                # Check rate limit again after delay
+                if is_ai_rate_limited():
+                    for item in chunk:
+                        results_map[item["index"]] = ("Others", True)
+                    continue
+
+                prompt = f"""
+                Please categorize the following batch of bank transactions:
+                Transactions:
+                {json.dumps(chunk, indent=2)}
+
+                Allowed Categories:
+                {", ".join(categories)}
+
+                You must return a JSON object containing a list of results conforming strictly to the target schema.
+                If none of the categories apply to a transaction, use 'Others'.
+                """
+                
+                try:
+                    response = gemini_client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            response_mime_type="application/json",
+                            response_schema=BatchCategorizationResponse,
+                            temperature=0.1,
+                        ),
+                    )
+                    batch_result = BatchCategorizationResponse.model_validate_json(response.text)
+                    for item in batch_result.results:
+                        results_map[item.index] = (item.category, False)
+                except Exception as e:
+                    print(f"Batch GenAI categorization call failed for chunk {i//chunk_size}: {e}")
+                    if _is_rate_limit_error(e):
+                        trigger_ai_rate_limit(5)
+                        if should_send_notification():
+                            send_notification_email(
+                                "Spend Analyzer: Gemini API Rate Limit Triggered",
+                                "The Gemini API rate limit has been reached (429/RESOURCE_EXHAUSTED). The system is falling back to local rule and vector similarity matching."
+                            )
+                        # Mark current chunk as rate-limited
+                        for item in chunk:
+                            results_map[item["index"]] = ("Others", True)
+                    else:
+                        for item in chunk:
+                            results_map[item["index"]] = ("Others", False)
+                    
         # Populate responses back in place
         for idx, tx in zip(still_unmatched_indices, still_unmatched_payloads):
-            tx["category"] = results_map.get(idx, "Others")
+            cat, rate_limited = results_map.get(idx, ("Others", False))
+            tx["category"] = cat
+            tx["ai_rate_limited"] = rate_limited
     else:
         # Fallback if Gemini client is not initialized
         for tx in still_unmatched_payloads:
             tx["category"] = "Others"
+            tx["ai_rate_limited"] = False
 
     return transactions_data

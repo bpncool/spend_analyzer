@@ -126,15 +126,49 @@ async def run_parser_agent(file_path: str, run_id: str) -> bool:
     """
     log_run_step(run_id, "parsing", f"Document Parser Agent checking statement: {os.path.basename(file_path)}")
     
+    # Deterministic result tracker — set by tools, not by LLM prose.
+    _result = {"parsed": False}
+    
+    def detect_statement_format_tracked(file_path: str) -> str:
+        """Reads a file and detects its bank statement format layout.
+        Args:
+            file_path: The absolute path of the statement file on disk.
+        Returns:
+            One of 'axis_pdf', 'hdfc_txt', 'generic_csv', or 'unknown'.
+        """
+        return detect_statement_format(file_path)
+    
+    def parse_and_persist_statement_tracked(file_path: str, format_type: str) -> str:
+        """Parses a recognized statement file and persists its transactions to the database.
+        Args:
+            file_path: The absolute path of the statement file.
+            format_type: The format code ('axis_pdf', 'hdfc_txt', or 'generic_csv').
+        Returns:
+            A success summary message or error.
+        """
+        result = parse_and_persist_statement(file_path, format_type)
+        if not result.startswith("error"):
+            _result["parsed"] = True
+        return result
+    
+    def notify_missing_parser_tracked(file_path: str) -> str:
+        """Dispatches a notification email to the human administrator when a file format is unsupported.
+        Args:
+            file_path: Absolute path to the file requesting a parser.
+        Returns:
+            A confirmation status message.
+        """
+        return notify_missing_parser(file_path)
+    
     config = LocalAgentConfig(
         system_instructions=(
             "You are Super Agent 1 (Document Parser). Your task is to process the bank statement file. "
-            "1. First, call `detect_statement_format` to find out what format the file is. "
-            "2. If it returns 'axis_pdf', 'hdfc_txt', or 'generic_csv', parse the statement by calling `parse_and_persist_statement`. "
-            "3. If it returns 'unknown', notify the human administrator by calling `notify_missing_parser`. "
+            "1. First, call `detect_statement_format_tracked` to find out what format the file is. "
+            "2. If it returns 'axis_pdf', 'hdfc_txt', or 'generic_csv', parse the statement by calling `parse_and_persist_statement_tracked`. "
+            "3. If it returns anything else (e.g. 'unknown' or an error), notify the human administrator by calling `notify_missing_parser_tracked`. "
             "Keep your final answer concise, summarizing the action taken."
         ),
-        tools=[detect_statement_format, parse_and_persist_statement, notify_missing_parser]
+        tools=[detect_statement_format_tracked, parse_and_persist_statement_tracked, notify_missing_parser_tracked]
     )
     
     async with Agent(config) as agent:
@@ -144,8 +178,10 @@ async def run_parser_agent(file_path: str, run_id: str) -> bool:
         
         log_run_step(run_id, "parsing", f"Document Parser Agent result: {text_out}")
         
-        # Check if it was successfully parsed
-        # If it failed or notified human, we return False
+        # Success is determined by whether the parse tool actually ran without error,
+        # with fallback to substring-matching the LLM's natural language summary for mock agent tests.
+        if _result["parsed"]:
+            return True
         if "successfully processed" in text_out.lower() or "saved" in text_out.lower():
             return True
         return False
