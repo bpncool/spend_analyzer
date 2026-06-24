@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional, Any, Dict
+from pydantic import BaseModel
 import os
 import uuid
 
@@ -15,7 +16,8 @@ from .schemas import (
 )
 from .parser import (
     parse_generic_csv_statement, parse_axis_bank_pdf_statement, parse_hdfc_bank_txt_statement,
-    parse_statement_with_gemini, detect_bank_from_pdf, detect_bank_from_txt, detect_bank_from_csv
+    parse_statement_with_gemini, detect_bank_from_pdf, detect_bank_from_txt, detect_bank_from_csv,
+    detect_bank_from_custom, DYNAMIC_PARSERS
 )
 from .categorizer import categorize_transaction, categorize_transactions_batch, PREDEFINED_CATEGORIES, get_embedding, get_embeddings_batch, compute_cosine_similarity
 from .analytics import generate_natural_language_insights
@@ -109,9 +111,8 @@ async def upload_bank_statement(
 ):
     """
     Secure statement ingestion:
-    Receives statement file, tries standard code parser.
-    If fails or extracts 0 rows, falls back to AI statement parser (Gemini)
-    with a cost estimation and human confirmation flow.
+    Receives statement file, tries dynamic custom or standard code parser.
+    If fails or extracts 0 rows, falls back to Parser Creator flow (user approved).
     """
     contents = await file.read()
     filename = file.filename.lower()
@@ -119,80 +120,69 @@ async def upload_bank_statement(
     source_type = ""
     parse_error = None
     
-    # 1. Try standard parser
+    # 1. Try dynamic custom and standard parsers
     try:
-        if filename.endswith(".csv"):
-            bank = detect_bank_from_csv(contents)
-            parsed_txs = parse_generic_csv_statement(contents)
-            source_type = f"{bank}_csv_upload"
-        elif filename.endswith(".pdf"):
-            bank = detect_bank_from_pdf(contents)
-            if bank == "axis":
-                parsed_txs = parse_axis_bank_pdf_statement(contents)
-                source_type = "axis_bank_pdf_upload"
-            else:
-                raise ValueError("Unsupported PDF bank statement format. Fall back to AI parsing.")
-        elif filename.endswith(".txt"):
-            bank = detect_bank_from_txt(contents)
-            if bank == "hdfc":
-                parsed_txs = parse_hdfc_bank_txt_statement(contents)
-                source_type = "hdfc_bank_txt_upload"
-            else:
-                raise ValueError("Unsupported TXT bank statement format. Fall back to AI parsing.")
+        # Check custom parser first
+        custom_bank = detect_bank_from_custom(contents)
+        if custom_bank and custom_bank in DYNAMIC_PARSERS:
+            parsed_txs = DYNAMIC_PARSERS[custom_bank]["parse"](contents)
+            source_type = f"{custom_bank}_upload"
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unsupported file format. Please upload a .csv, .pdf, or .txt file."
-            )
+            if filename.endswith(".csv"):
+                bank = detect_bank_from_csv(contents)
+                if bank != "generic" and bank in DYNAMIC_PARSERS:
+                    parsed_txs = DYNAMIC_PARSERS[bank]["parse"](contents)
+                    source_type = f"{bank}_csv_upload"
+                else:
+                    parsed_txs = parse_generic_csv_statement(contents)
+                    source_type = f"{bank}_csv_upload"
+            elif filename.endswith(".pdf"):
+                bank = detect_bank_from_pdf(contents)
+                if bank == "axis":
+                    parsed_txs = parse_axis_bank_pdf_statement(contents)
+                    source_type = "axis_bank_pdf_upload"
+                else:
+                    raise ValueError("Unsupported PDF bank statement format.")
+            elif filename.endswith(".txt"):
+                bank = detect_bank_from_txt(contents)
+                if bank == "hdfc":
+                    parsed_txs = parse_hdfc_bank_txt_statement(contents)
+                    source_type = "hdfc_bank_txt_upload"
+                else:
+                    raise ValueError("Unsupported TXT bank statement format.")
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Unsupported file format. Please upload a .csv, .pdf, or .txt file."
+                )
     except Exception as e:
         parse_error = e
 
-    # 2. Trigger AI Fallback if standard parser failed or found no transactions
+    # 2. Trigger Parser Creator flow if standard/custom parser failed or found no transactions
     if parse_error or not parsed_txs:
-        file_text = ""
-        if filename.endswith(".pdf"):
-            try:
-                import pdfplumber
-                import io
-                text_parts = []
-                with pdfplumber.open(io.BytesIO(contents)) as pdf:
-                    for page in pdf.pages:
-                        t = page.extract_text()
-                        if t:
-                            text_parts.append(t)
-                file_text = "\n".join(text_parts)
-            except Exception:
-                file_text = ""
-        else:
-            try:
-                file_text = contents.decode("utf-8", errors="ignore")
-            except Exception:
-                file_text = ""
-
-        if file_text.strip():
-            file_id = str(uuid.uuid4())
-            est_tokens = len(file_text) // 4
-            input_cost = (est_tokens / 1000000.0) * 0.075
-            output_cost = (1500 / 1000000.0) * 0.30
-            estimated_cost_usd = max(0.0002, round(input_cost + output_cost, 6))
+        file_id = str(uuid.uuid4())
+        ext = filename.split(".")[-1]
+        
+        # Save statement to a pending directory
+        pending_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads_pending_parser")
+        os.makedirs(pending_dir, exist_ok=True)
+        
+        temp_file_path = os.path.join(pending_dir, f"temp_unknown_{file_id}.{ext}")
+        with open(temp_file_path, "wb") as f:
+            f.write(contents)
             
-            temp_file_cache[file_id] = {
-                "text": file_text,
-                "filename": file.filename,
-                "source_type": filename.split(".")[-1] + "_upload"
-            }
-            
-            return {
-                "status": "parse_failed",
-                "file_id": file_id,
-                "estimated_cost_usd": estimated_cost_usd,
-                "detail": f"Standard parser failed to read statement. AI parsing fallback is available. Error: {str(parse_error)}" if parse_error else "Standard parser found 0 transactions in this statement. AI parsing fallback is available."
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Failed to parse statement and no readable text found: {str(parse_error)}" if parse_error else "Statement contains no readable text."
-            )
+        # Extract preview text
+        from .agents.parser_creator_agent import extract_preview_text
+        text_preview = extract_preview_text(temp_file_path, 2000)
+        
+        return {
+            "status": "new_parser_required",
+            "file_id": file_id,
+            "filename": file.filename,
+            "file_path": temp_file_path,
+            "text_preview": text_preview,
+            "detail": f"Standard parser failed to read statement. Error: {str(parse_error)}" if parse_error else "Standard parser found 0 transactions in this statement."
+        }
 
     added_count = 0
     duplicate_count = 0
@@ -230,7 +220,6 @@ async def upload_bank_statement(
             )
             db.add(tx)
             added_count += 1
-
             
         db.commit()
     
@@ -239,6 +228,81 @@ async def upload_bank_statement(
         "message": f"Successfully processed statement: {file.filename}",
         "transactions_imported": added_count,
         "duplicates_skipped": duplicate_count
+    }
+
+class BuildParserRequest(BaseModel):
+    file_id: str
+    file_path: str
+
+@app.post("/api/upload/build-parser")
+async def build_parser_endpoint(
+    req: BuildParserRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Asynchronously builds a parser for the specified unknown statement file,
+    runs it, and updates the transaction ledger.
+    """
+    file_id = req.file_id
+    file_path = req.file_path
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Statement file not found on server."
+        )
+        
+    from .agents.orchestrator import orchestrate_statement_processing
+    from .agents.utility_agents import init_agent_run
+    import asyncio
+    
+    # Initialize an agent run entry in database
+    run_id = init_agent_run(f"upload_trigger ({os.path.basename(file_path)})")
+    
+    # Start parser creator + pipeline steps in the background
+    async def run_background():
+        from .agents.parser_creator_agent import run_parser_creator_agent
+        from .agents.parser_agent import run_parser_agent
+        from .agents.mapper_agent import run_mapper_agent
+        from .agents.insights_agent import run_insights_agent
+        from .agents.frontend_agent import run_frontend_agent
+        from .agents.utility_agents import log_run_step
+        
+        try:
+            log_run_step(run_id, "started", "Starting background parser generation and execution.")
+            creator_success = await run_parser_creator_agent(file_path, run_id)
+            if creator_success:
+                # Re-call parser agent
+                try:
+                    parse_success = await run_parser_agent(file_path, run_id)
+                except Exception:
+                    parse_success = False
+                if parse_success:
+                    # Proceed with mapping, insights, and frontend agent
+                    await run_mapper_agent(run_id)
+                    await run_insights_agent(run_id)
+                    await run_frontend_agent(run_id)
+                    
+                    # Clean up file
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                else:
+                    log_run_step(run_id, "failed", "Re-parsing statement failed after builder completed.", "Parse failure.")
+            else:
+                log_run_step(run_id, "failed", "Failed to build a valid parser for this format.", "Creator failed.")
+        except Exception as e:
+            import traceback
+            log_run_step(run_id, "failed", f"Error in background processing: {str(e)}", traceback.format_exc())
+            
+    # Spawn background task
+    asyncio.create_task(run_background())
+    
+    return {
+        "status": "processing",
+        "run_id": run_id,
+        "message": "Parser generation and processing started in the background."
     }
 
 @app.post("/api/upload/ai-confirm")

@@ -31,12 +31,13 @@ graph TD
 ```
 
 ### 1. Ingestion Flow (Manual vs. Autonomous)
-* **Manual Ingestion**: The user uploads a file through the React dashboard using the `POST /api/upload` endpoint. FastAPI tries standard code parsers first. If they fail (or return 0 rows), it caches the text, calculates token cost estimations, and prompts the user for explicit approval to fall back to the Gemini statement parser.
+* **Manual Ingestion**: The user uploads a file through the React dashboard using the `POST /api/upload` endpoint. FastAPI tries standard code parsers first. If they fail (or return 0 rows), it returns a `new_parser_required` status, saves the file in `uploads_pending_parser/`, and prompts the user for explicit approval to build a custom parser using the Parser Creator Agent. Once approved, it processes the statement in the background and prompts the user to refresh the dashboard when done.
 * **Autonomous Ingestion**: A directory trigger loop polls `backend/statements_to_process/` and `backend/email_inbox/` folders every 10 seconds. If a file is found, it instantiates the Multi-Agent Orchestrator pipeline.
 
 ### 2. Multi-Agent Pipeline
-* **Orchestrator (`orchestrator.py`)**: Manages execution state, initializes runs in the database, runs Agents 1-4 sequentially, handles failures, dispatches notifications, and cleans up processed/invalid statement files to prevent infinite loops.
-* **Super Agent 1 (`parser_agent.py`)**: Runs layout checks. If the layout matches known banks (Axis PDF, HDFC TXT, Generic CSV), it parses and saves the transaction records to the DB. If unknown, it halts execution, transitions the run status to `failed`, and sends a mock request email to `scratch/notifications.jsonl` asking the developer to write a parser script.
+* **Orchestrator (`orchestrator.py`)**: Manages execution state, initializes runs in the database, runs Agents 1-4 sequentially, handles failures, dispatches notifications, and cleans up processed/invalid statement files.
+* **Super Agent 1 (`parser_agent.py`)**: Runs layout checks. If the layout matches known banks (Axis PDF, HDFC TXT, Generic CSV) or dynamically registered custom parsers, it parses and saves the transaction records. If unknown, it raises `UnknownLayoutException`. For upload triggers, the orchestrator halts for user approval. For background folder/email triggers, the orchestrator automatically spawns the **Parser Creator Agent** to generate, validate, and dynamically register a new parser in `backend/app/parser.py`.
+* **Parser Creator Agent (`parser_creator_agent.py`)**: Initiated when an unknown layout is detected. It takes a text preview, uses Gemini to write python parser code, validates the code in a local sandbox against the statement bytes, saves it under `custom_parsers/`, and appends the registration hook to `parser.py`.
 * **Super Agent 2 (`mapper_agent.py`)**: Executes rules-based substring checks (Tier 1) and local vector similarity comparisons (Tier 2) using `fastembed` dense vectors (`BAAI/bge-small-en-v1.5`). Any remaining unmatched transactions are batched into chunks and sent to the Gemini API (`gemini-2.5-flash`) for structured categorization (Tier 3).
 * **Super Agent 3 (`insights_agent.py`)**: Reads the SQLite tables to execute monthly aggregates. It computes a Pearson correlation matrix identifying discretionary categories (e.g. food delivery, cab services) that negatively impact monthly net balance deltas. It then invokes Gemini to write short, highly actionable behavior guidelines.
 * **Super Agent 4 (`frontend_agent.py`)**: Performs final metrics computations (consolidated income, outflow, savings rate) and runs a verification leak-check ensuring that no linked transactions or `Self-Transfers` leaked into consolidation calculations. It marks the execution run status as `completed`.
@@ -178,5 +179,34 @@ To prevent application blockages and excess token consumption during high traffi
    - If blocked or if a `429`/`RESOURCE_EXHAUSTED` error is caught, the transactions are categorized under `"Others"` and flagged as `ai_rate_limited = True` in the database.
 4. **Dashboard Control & Reclassification**:
    - Displays a warning banner indicating active block windows and remaining retry duration.
-   - Provides table filtering via "⚠️ Rate Limited Only" to view flagged items.
-   - Allows users to select multiple transactions and force re-classification through `POST /api/transactions/reclassify` when limits clear, running the entire mapping pipeline.
+    - Provides table filtering via "⚠️ Rate Limited Only" to view flagged items.
+    - Allows users to select multiple transactions and force re-classification through `POST /api/transactions/reclassify` when limits clear, running the entire mapping pipeline.
+
+---
+
+## 🖥️ Frontend State Flow & Interactive Ledger
+
+To ensure zero-latency responses for sorting and filtering, all operations on the primary ledger table are computed client-side within the React tree of `App.tsx`:
+
+1. **State Hooks (Sorting & Filtering)**:
+   - `sortField`: Tracks column to sort by (`date`, `amount`, `description`, `category`, `account_id`).
+   - `sortOrder`: Sorting direction (`asc` or `desc`).
+   - `filterTxType`: Standard type bounds (`all`, `inflow`, `outflow`).
+   - `filterDateRange`: Timeframe presets (`all`, `last30`, `thisMonth`, `lastMonth`, `custom`).
+   - `customStartDate` / `customEndDate`: Tracks date selections when `filterDateRange === "custom"`.
+   - `minAmount` / `maxAmount`: Numeric range thresholds for filtering absolute transaction amounts.
+   - `showAdvancedFilters`: Toggle state for displaying the collapsible advanced parameters card.
+
+2. **Computation Engine (`filteredTransactions`)**:
+   - Updates dynamically on state changes via a sequential functional pipe:
+     - **Match Search**: Description or Category matches the parsed text (case-insensitive).
+     - **Match Category**: Categorization matches the selected item.
+     - **Match Rate Limit**: AI rate limit check.
+     - **Match Transaction Type**: Amount signs match type conditions (`amount > 0` for Inflow, `amount < 0` for Outflow).
+     - **Match Date Range**: Dates match calendar offsets (e.g. past 30 days based on local clock, or within custom boundaries).
+     - **Match Amount Range**: Absolute transaction value `Math.abs(tx.amount)` is within min and max values.
+     - **Sort Pipeline**: Values are sorted chronologically, numerically, or alphabetically based on the current `sortField` and `sortOrder`.
+
+3. **Global Reset Trigger**:
+   - `isAnyFilterActive` evaluates if any filter is modified from its default value.
+   - `handleResetFilters()` reverts all states to original defaults in one batch action.

@@ -579,3 +579,76 @@ def detect_bank_from_csv(file_bytes: bytes) -> str:
     elif "hdfc" in content_lower:
         return "hdfc"
     return "generic"
+
+
+# =============================================================================
+# Dynamic Custom Parser Registry
+# =============================================================================
+DYNAMIC_PARSERS = {}
+
+def register_custom_parser(format_name: str, detect_fn, parse_fn):
+    """Registers a dynamic parser format with its format detector and parsing functions."""
+    DYNAMIC_PARSERS[format_name] = {
+        "detect": detect_fn,
+        "parse": parse_fn
+    }
+
+def detect_bank_from_custom(file_bytes: bytes) -> Optional[str]:
+    """Checks if any dynamically registered custom parser matches the file content."""
+    if not DYNAMIC_PARSERS:
+        return None
+    text = ""
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            if pdf.pages:
+                text = "\n".join([page.extract_text() or "" for page in pdf.pages[:2]])
+    except Exception:
+        try:
+            text = file_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            try:
+                text = file_bytes.decode("latin-1", errors="ignore")
+            except Exception:
+                text = ""
+
+    text_lower = text.lower()
+    for format_name, fns in DYNAMIC_PARSERS.items():
+        try:
+            if fns["detect"](text) or fns["detect"](text_lower):
+                return format_name
+        except Exception:
+            continue
+    return None
+
+def load_and_register_saved_parsers():
+    """Scans the custom_parsers directory and registers any existing files."""
+    import os
+    import importlib
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    custom_parsers_dir = os.path.join(current_dir, "custom_parsers")
+    if not os.path.exists(custom_parsers_dir):
+        return
+        
+    for filename in os.listdir(custom_parsers_dir):
+        if filename.startswith("custom_") and filename.endswith(".py"):
+            module_name = filename[:-3]
+            try:
+                # Relative import since it's within the package
+                module = importlib.import_module(f".custom_parsers.{module_name}", package=__package__)
+                if hasattr(module, "detect_format") and hasattr(module, "parse_statement"):
+                    format_name = module_name
+                    register_custom_parser(
+                        format_name,
+                        module.detect_format,
+                        module.parse_statement
+                    )
+                    print(f"Dynamically registered parser: {format_name}")
+            except Exception as e:
+                print(f"Failed to load dynamic parser {module_name}: {e}")
+
+# Run autoloader
+load_and_register_saved_parsers()
+
+# === REGISTERED CUSTOM PARSERS ===
+

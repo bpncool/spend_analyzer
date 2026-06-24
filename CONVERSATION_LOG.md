@@ -52,6 +52,29 @@ This document traces the development history, architectural decisions, technical
 
 ---
 
+## 📊 Phase 3: Interactive Ledger & Advanced Filters (UX Era)
+
+### 1. Multi-Column Interactive Sorting
+* **Problem**: Transactions were displayed in a static table view with a fixed chronological descending sort. Users had no way to explore the largest expenses, sort by description alphabetically, or group transactions by category or bank account.
+* **Solution**: Implemented interactive sorting headers on the client-side:
+  - Made Date, Account, Description, Category, and Amount headers clickable.
+  - Linked them to reactive React states (`sortField` and `sortOrder`) triggering instantaneous sorting.
+  - Added clean indicators (up/down chevrons and hoverable Lucide icons) to provide real-time visual feedback on active sorting columns and directions.
+
+### 2. Multi-Tiered Advanced Filters Panel
+* **Problem**: In large ledgers, finding specific transactions by category, value, or timeframe required scanning page after page, as only simple category dropdowns and description search inputs were available.
+* **Solution**: Developed a collapsible glassmorphic filter toolbar featuring:
+  - **Transaction Type Selector**: Allows users to filter specifically for Income/Inflows or Expenses/Outflows.
+  - **Date Range Presets**: Quick bounds for "Last 30 Days", "This Month", and "Last Month", plus a "Custom Range" picker that renders start/end calendar dates.
+  - **Min/Max Amount Boundaries**: Filters records by value range, letting users isolate high-value or low-value items.
+  - **AI Rate Limit Indicator**: Toggles matching of transactions that defaulted to "Others" due to Gemini rate limits.
+  - **Dynamic Reset & Clears**: An inline clear button in search input and a global "Reset" button that instantly clear all active filters.
+
+### 3. Styled Empty State
+* **Solution**: Implemented a responsive "No Transactions Found" dashboard drawer containing an empty-state illustration and a direct reset link if filters exclude all ledger entries.
+
+---
+
 ## ⚙️ Key Technical Decisions & Constraints
 
 ### 1. Disabling Uvicorn `--reload`
@@ -67,3 +90,26 @@ This document traces the development history, architectural decisions, technical
 
 ### 4. Git Remote Integration
 * To push the project code, we initialized a repository, established a `.gitignore` to protect environment configurations and statement PDFs/TXTs/DBs, linked it to SSH remote origin, resolved merge conflicts with default GitHub files, and pushed cleanly to the `main` branch.
+
+---
+
+## 🤖 Phase 4: Autonomous Parser Creator (The Autonomy Era)
+
+### 1. Dynamic Custom Parser Generation
+* **Goal**: Enable the system to dynamically generate, test, and register statement parsers for unrecognized banking layouts rather than halting or falling back to raw LLM parsing every time.
+* **Implementation**:
+  - Created `parser_creator_agent.py` to extract text previews (first 2000 characters), send them to Gemini with a structured schema, and output a custom Python parsing module containing layout detection (`detect_format`) and parsing (`parse_statement`) logic.
+  - Implemented sandbox validation which dynamically compiles the generated parser module and runs it against the target file bytes. If it fails validation (throws errors or returns invalid columns/empty records), it feeds the traceback back to Gemini for self-correction (up to 2 retries).
+  - On success, it writes the parser to `backend/app/custom_parsers/custom_parser_<format_name>.py` and dynamically appends the registration hook to `backend/app/parser.py`.
+
+### 2. Symmetrical Orchestration & Trigger Handling
+* Refactored `run_parser_agent` to raise a custom `UnknownLayoutException` on unrecognized bank formats.
+* In `orchestrator.py`:
+  - If a file is uploaded via manual REST API trigger, the orchestrator halts parsing and returns `"parser_required"`, prompting the user for approval.
+  - If triggered via background folder triggers or email triggers, the orchestrator autonomously spawns the Parser Creator agent, runs code generation, sandbox tests, registers the new module, and then successfully re-runs the parser agent without human intervention.
+* Created `backend/tests/test_parser_creator.py` to assert correct mock generation, validation, dynamic import, and registration.
+
+### 3. Frontend Approval & Interactive Ledgers
+* Updated the React dashboard to display an "Unknown Statement Format" glassmorphic dialog showing text previews and asking the user for approval to build a parser.
+* Clicking "Build Parser" triggers the background execution thread asynchronously.
+* Once the background run transitions to `"completed"`, the dashboard displays a checkmark confirmation prompt, refreshing metrics and transactions instantly when the user clicks "OK".

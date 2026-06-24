@@ -1,7 +1,7 @@
 import os
 import traceback
 from .utility_agents import init_agent_run, log_run_step
-from .parser_agent import run_parser_agent
+from .parser_agent import run_parser_agent, UnknownLayoutException
 from .mapper_agent import run_mapper_agent
 from .insights_agent import run_insights_agent
 from .frontend_agent import run_frontend_agent
@@ -20,16 +20,51 @@ async def orchestrate_statement_processing(file_path: str, trigger_source: str) 
     
     try:
         # Step 1: Parse the statement (Super Agent 1)
-        parse_success = await run_parser_agent(file_path, run_id)
-        if not parse_success:
-            # Either parsing failed or parser was not present (which triggers human email notification)
-            log_run_step(run_id, "failed", "Parser execution stopped. Human notification sent.", "Parser missing or parse failed.")
-            # Remove the unprocessed file from the directory so it doesn't loop trigger
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
-            return "human_required"
+        try:
+            parse_success = await run_parser_agent(file_path, run_id, raise_on_unknown=True)
+            if not parse_success:
+                log_run_step(run_id, "failed", "Parser execution stopped. Human notification sent.", "Parser missing or parse failed.")
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+                return "human_required"
+        except UnknownLayoutException:
+            if trigger_source == "upload_trigger":
+                log_run_step(run_id, "parsing", "Parser Creator: Unrecognized statement layout. Halting execution to await user approval.")
+                # We return 'parser_required' and DO NOT delete the statement file
+                return "parser_required"
+            else:
+                log_run_step(run_id, "parsing", "Parser Creator: Unrecognized statement layout. Spawning Parser Creator Agent autonomously.")
+                from .parser_creator_agent import run_parser_creator_agent
+                creator_success = await run_parser_creator_agent(file_path, run_id)
+                if creator_success:
+                    # Re-call the parser agent to parse the statement now that the parser exists
+                    try:
+                        parse_success = await run_parser_agent(file_path, run_id)
+                        if not parse_success:
+                            log_run_step(run_id, "failed", "Parser creator succeeded but re-parsing failed.", "Re-parse failure.")
+                            try:
+                                os.remove(file_path)
+                            except Exception:
+                                pass
+                            return "human_required"
+                    except Exception as e:
+                        log_run_step(run_id, "failed", f"Re-parse failed with error: {str(e)}")
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
+                        return "human_required"
+                else:
+                    log_run_step(run_id, "failed", "Autonomous parser creator failed to build a valid parser. Dispatched email notification to admin.", "Creator failure.")
+                    from .parser_agent import notify_missing_parser
+                    notify_missing_parser(file_path)
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                    return "human_required"
             
         # Step 2: Categorize/Map transactions (Super Agent 2)
         await run_mapper_agent(run_id)
