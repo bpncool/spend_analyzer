@@ -51,18 +51,20 @@ graph TD
   - [models.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/models.py): SQLAlchemy models for SQLite mapping.
   - [config.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/config.py): Environment settings (`DATABASE_URL`, `GEMINI_API_KEY`, etc.).
   - [categorizer.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/categorizer.py): 3-Tier Categorization Pipeline (Deterministic Regex rules -> Semantic Vector Cosine similarity via `fastembed` -> Agentic Gemini fallback).
-  - [parser.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/parser.py): Table/text extraction for Axis (PDF), HDFC (TXT), and Generic CSV files.
+  - [parser.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/parser.py): Table/text extraction for Axis (PDF), HDFC (TXT), Generic CSV, and dynamic custom parsers.
   - [analytics.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/analytics.py): Pearson correlation analyses on monthly aggregates and behavioral suggestions.
   - [rate_limiter.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/rate_limiter.py): In-memory rate limits & notification cooldown triggers.
+  - [custom_parsers/](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/custom_parsers/): Package directory for dynamically generated statement parsers.
 * **Autonomous Agents (`backend/app/agents/`)**:
   - [orchestrator.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/orchestrator.py): Orchestrates sequential agent lifecycle executions (Runs 1 to 4).
-  - [parser_agent.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/parser_agent.py): (Agent 1) Identifies statement bank layout and parses files.
+  - [parser_agent.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/parser_agent.py): (Agent 1) Identifies bank layout (including registered custom formats) and parses files.
+  - [parser_creator_agent.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/parser_creator_agent.py): Spawns code generation agent to build and test python parsers for unrecognized formats.
   - [mapper_agent.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/mapper_agent.py): (Agent 2) Groups transactions and executes the 3-Tier categorization pipeline.
   - [insights_agent.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/insights_agent.py): (Agent 3) Computes expense correlation metrics and calls Gemini for insights.
   - [frontend_agent.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/frontend_agent.py): (Agent 4) Performs leak check tests to block `Self-Transfers` from consolidated charts, and logs completion.
   - [triggers.py](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/backend/app/agents/triggers.py): Scans the `statements_to_process/` and `email_inbox/` folders for new files.
 * **Frontend Dashboard (`frontend/src/`)**:
-  - [App.tsx](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/frontend/src/App.tsx): React 19 Dashboard containing KPI metric blocks, Recharts visual graphs, transaction ledgers, linkage overrides, and agent pipeline logs.
+  - [App.tsx](file:///Users/bhaveshpachnanda/Antigravity%20Personal%20Finance%20Handler/frontend/src/App.tsx): React 19 Dashboard containing KPI metric blocks, Recharts visual graphs, transaction ledgers, linkage overrides, dynamic parser build prompts, and agent pipeline logs.
 
 ---
 
@@ -114,6 +116,15 @@ Pipeline execution logs:
 4. **Calculations Leak Check Rule**:
    > [!CAUTION]
    > Every consolidated financial calculation (Inflow, Outflow, Net, Savings Rate) and category chart query MUST explicitly exclude transactions categorized under `"Self-Transfers"` or where `linked_transaction_id IS NOT NULL`.
+5. **Dynamic Custom Parsers & Package-Agnostic Imports**:
+   > [!IMPORTANT]
+   > When dynamically compiling, validating, or running imports for dynamic custom parsers under `app/custom_parsers/`, ensure all imports and validation hooks use relative or package-agnostic paths (e.g. `__package__` and dynamic package resolutions) instead of hardcoded package prefixes like `"backend.app"`. This prevents `ModuleNotFoundError` across different runtime env configurations (e.g., uvicorn runner vs pytest runner).
+6. **Double-Trigger Prevention for Pending Uploads**:
+   > [!WARNING]
+   > Store files pending user approval for custom parser creator in the isolated directory `backend/uploads_pending_parser/` instead of `backend/statements_to_process/` to avoid triggering the background scanner thread loop automatically before the user confirms.
+7. **Post-Implementation Documentation Rule**:
+   > [!IMPORTANT]
+   > Once any feature, change, or bug fix has passed verification, run a check to update the repository documentation. Modify the relevant tracking documentation, markdown files (e.g., `ARCHITECT_AND_STRUCTURE.md`, `CONVERSATION_LOG.md`), or `.md` references within the project directory to reflect the exact state of the new code additions.
 
 ---
 
